@@ -8,4 +8,4 @@ You can use the included HostedZone template to spin up the DNS for your domain 
   2. Generate a [Personal Access Token](https://help.github.com/en/articles/creating-a-personal-access-token-for-the-command-line) for Github and store it in [Secrets Manager](https://aws.amazon.com/secrets-manager/).
   2. Deploy `pipeline.yml` via CloudFormation.
   3. Go to CodePipeline to watch your site deploy itself.
-  4. During the first Cloudfront deployment step an ACM Certificate will be created. Check the ACM Console during this step to validate the certificate.
+  4. During the Cloudfront deployment step an ACM Certificate will be created. Check the ACM Console during this step to validate the certificate.
