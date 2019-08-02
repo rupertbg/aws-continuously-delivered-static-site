@@ -1,0 +1,225 @@
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Github Repository
+        Parameters:
+          - GitHubOwner
+          - GitHubRepo
+          - GitHubBranch
+          - GitHubTokenSecretName
+          - GitHubTokenSecretKeyName
+      - Label:
+          default: Domain
+        Parameters:
+          - SiteDomainName
+          - HostedZoneId
+      - Label:
+          default: Source
+        Parameters:
+          - WebsiteSourceDirectory
+    ParameterLabels:
+      GitHubOwner:
+        default: What's the username of the repo owner?
+      GitHubRepo:
+        default: What's the name of the repo?
+      GitHubBranch:
+        default: Which branch would you like to use?
+      GitHubTokenSecretName:
+        default: What is the name of the secret in Secrets Manager for your Github credentials?
+      GitHubTokenSecretKeyName:
+        default: What is the JSON key for the value of the Personal Access Token?
+      WebsiteSourceDirectory:
+        default: What is the path of the directory in the repo where your index.html is stored?
+
+Parameters:
+
+  GitHubOwner:
+    Type: String
+    Description: The username or org that owns the repo
+
+  GitHubRepo:
+    Type: String
+    Description: The name of the repo as it appears in Github
+
+  GitHubBranch:
+    Type: String
+    Description: The branch to pull
+    Default: master
+
+  SiteDomainName:
+    Type: String
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    Description: Domain name for site e.g. rupertbg.nz (no www)
+    ConstraintDescription: Must be a valid domain name
+
+  HostedZoneId:
+    Type: String
+    AllowedPattern: '[A-Z0-9]{14}'
+    Description: Existing HostedZone's ID
+    ConstraintDescription: Must be an AWS Route53 HostedZoneId
+
+  GitHubTokenSecretName:
+    Type: String
+    Description: The name of the Secrets Manager secret that contains a GitHub personal access token
+    Default: Github
+
+  GitHubTokenSecretKeyName:
+    Type: String
+    Description: The JSON key name of the Secrets Manager value
+    Default: PersonalAccessToken
+
+  WebsiteSourceDirectory:
+    Type: String
+    Description: The directory name in the repo where the website source is
+    Default: src
+
+Resources:
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineBucket
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: source
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Sub '{{resolve:secretsmanager:${GitHubTokenSecretName}:SecretString:${GitHubTokenSecretKeyName}}}'
+              RunOrder: 1
+        - Name: Update
+          Actions:
+            - Name: Pipeline
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts:
+                - Name: source
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Ref AWS::StackName
+                RoleArn: !GetAtt CodePipelineRole.Arn
+                TemplatePath: source::pipeline.yml
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ParameterOverrides: !Sub |
+                  {
+                    "SiteDomainName": "${SiteDomainName}",
+                    "HostedZoneId": "${HostedZoneId}",
+                    "GitHubOwner": "${GitHubOwner}",
+                    "GitHubRepo": "${GitHubRepo}",
+                    "GitHubBranch": "${GitHubBranch}"
+                  }
+              RunOrder: 1
+        - Name: Upload
+          Actions:
+            - Name: Site
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: source
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Cloudfront
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts:
+                - Name: source
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Sub ${AWS::StackName}-site
+                RoleArn: !GetAtt CodePipelineRole.Arn
+                TemplatePath: source::infra.yml
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ParameterOverrides: !Sub |
+                  {
+                    "SiteDomainName": "${SiteDomainName}",
+                    "HostedZoneId": "${HostedZoneId}",
+                    "WebsiteBucketDomainName": "${WebsiteBucket.DomainName}",
+                    "WebsiteBucket":" ${WebsiteBucket}"
+                  }
+              RunOrder: 1
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/ubuntu-base:14.04
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec:
+          !Sub |
+            version: 0.2
+            phases:
+              post_build:
+                commands:
+                  - aws s3 sync ${WebsiteSourceDirectory} s3://${WebsiteBucket} --delete
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
